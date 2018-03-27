@@ -1,0 +1,5 @@
+*.pyc
+output
+tensorboard
+.idea
+__pycache__/
