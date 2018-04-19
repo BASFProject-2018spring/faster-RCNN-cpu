@@ -224,6 +224,7 @@ class Network(nn.Module):
     self._losses['rpn_cross_entropy'] = rpn_cross_entropy
     self._losses['rpn_loss_box'] = rpn_loss_box
 
+    # Classification is more important
     loss = cross_entropy + loss_box + rpn_cross_entropy + rpn_loss_box
     self._losses['total_loss'] = loss
 
@@ -241,7 +242,7 @@ class Network(nn.Module):
     # change it so that the score has 2 as its channel size
     rpn_cls_score_reshape = rpn_cls_score.view(1, 2, -1, rpn_cls_score.size()[-1]) # batch * 2 * (num_anchors*h) * w
     rpn_cls_prob_reshape = F.softmax(rpn_cls_score_reshape)
-
+    
     # Move channel to the last dimenstion, to fit the input of python functions
     rpn_cls_prob = rpn_cls_prob_reshape.view_as(rpn_cls_score).permute(0, 2, 3, 1) # batch * h * w * (num_anchors * 2)
     rpn_cls_score = rpn_cls_score.permute(0, 2, 3, 1) # batch * h * w * (num_anchors * 2)
@@ -272,8 +273,28 @@ class Network(nn.Module):
 
     return rois
 
-  def _region_classification(self, fc7):
-    cls_score = self.cls_score_net(fc7)
+  def _region_classification(self, fc7, rois):
+    rois = rois.detach()
+    x1 = rois[:, 1::4]
+    y1 = rois[:, 2::4]
+    x2 = rois[:, 3::4]
+    y2 = rois[:, 4::4]
+    
+    owidth = (x2 - x1) / 50.0
+    oheight = (y2 - y1) / 50.0
+    oarea = owidth * oheight
+    
+    cls_feature = self.cls_score_net_1(torch.cat((fc7,fc7*oarea,owidth,oheight,oarea,owidth*owidth,oheight*oheight,oarea*oarea),1))
+    cls_feature = self.cls_relu(cls_feature)
+    cls_feature = self.cls_score_net_2(cls_feature)
+    cls_feature = self.cls_relu(cls_feature)
+    #cls_feature = self.cls_relu(cls_feature)
+    cls_feature = self.cls_score_net_3(cls_feature)
+    cls_feature = self.cls_relu(cls_feature)
+    #cls_feature = self.cls_score_net_4(cls_feature)
+    #cls_feature = self.cls_relu(cls_feature)
+    cls_score = self.cls_score_net_5(cls_feature)
+    
     cls_pred = torch.max(cls_score, 1)[1]
     cls_prob = F.softmax(cls_score)
     bbox_pred = self.bbox_pred_net(fc7)
@@ -316,10 +337,14 @@ class Network(nn.Module):
     self.rpn_net = nn.Conv2d(self._net_conv_channels, cfg.RPN_CHANNELS, [3, 3], padding=1)
 
     self.rpn_cls_score_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 2, [1, 1])
-
+    
     self.rpn_bbox_pred_net = nn.Conv2d(cfg.RPN_CHANNELS, self._num_anchors * 4, [1, 1])
-
-    self.cls_score_net = nn.Linear(self._fc7_channels, self._num_classes)
+    self.cls_score_net_1 = nn.Linear(self._fc7_channels*2+6, 1024)
+    self.cls_relu = nn.ReLU(inplace=True)
+    self.cls_score_net_2 = nn.Linear(1024, 1024)
+    self.cls_score_net_3 = nn.Linear(1024, 1024)
+    #self.cls_score_net_4 = nn.Linear(10, 10)
+    self.cls_score_net_5 = nn.Linear(1024, self._num_classes)
     self.bbox_pred_net = nn.Linear(self._fc7_channels, self._num_classes * 4)
 
     self.init_weights()
@@ -350,7 +375,7 @@ class Network(nn.Module):
           summaries.append(self._add_train_summary(k, var))
 
       self._image_gt_summaries = {}
-
+    
     return summaries
 
   def _predict(self):
@@ -360,7 +385,7 @@ class Network(nn.Module):
 
     # build the anchors for the image
     self._anchor_component(net_conv.size(2), net_conv.size(3))
-
+   
     rois = self._region_proposal(net_conv)
     if cfg.POOLING_MODE == 'crop':
       pool5 = self._crop_pool_layer(net_conv, rois)
@@ -371,8 +396,8 @@ class Network(nn.Module):
       torch.backends.cudnn.benchmark = True # benchmark because now the input size are fixed
     fc7 = self._head_to_tail(pool5)
 
-    cls_prob, bbox_pred = self._region_classification(fc7)
-
+    cls_prob, bbox_pred = self._region_classification(fc7,rois)
+    
     for k in self._predictions.keys():
       self._score_summaries[k] = self._predictions[k]
 
@@ -409,11 +434,15 @@ class Network(nn.Module):
       else:
         m.weight.data.normal_(mean, stddev)
       m.bias.data.zero_()
-
+      
     normal_init(self.rpn_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
     normal_init(self.rpn_cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
     normal_init(self.rpn_bbox_pred_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
-    normal_init(self.cls_score_net, 0, 0.01, cfg.TRAIN.TRUNCATED)
+    normal_init(self.cls_score_net_1, 0, 0.01, cfg.TRAIN.TRUNCATED)
+    normal_init(self.cls_score_net_2, 0, 0.01, cfg.TRAIN.TRUNCATED)
+    normal_init(self.cls_score_net_3, 0, 0.01, cfg.TRAIN.TRUNCATED)
+    #normal_init(self.cls_score_net_4, 0, 0.01, cfg.TRAIN.TRUNCATED)
+    normal_init(self.cls_score_net_5, 0, 0.01, cfg.TRAIN.TRUNCATED)
     normal_init(self.bbox_pred_net, 0, 0.001, cfg.TRAIN.TRUNCATED)
 
   # Extract the head feature maps, for example for vgg16 it is conv5_3
@@ -488,7 +517,7 @@ class Network(nn.Module):
 
   def load_state_dict(self, state_dict):
     """
-    Because we remove the definition of fc layer in resnet now, it will fail when loading
+    Because we remove the definition of fc layer in resnet now, it will fail when loading 
     the model trained before.
     To provide back compatibility, we overwrite the load_state_dict
     """
